@@ -9,13 +9,12 @@ const cn = {
   port: 5432,
   database: 'bpt',
   user: 'bpt',
-  password: ''
+  password: '',
+  poolSize: 20
 };
 
 const db = pgp(cn);
 
 export class DB {
-  static getClient() {
-    return db;
-  }
+  static client = db;
 }

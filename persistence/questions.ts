@@ -5,8 +5,7 @@ import {Client} from 'pg';
 import {Question} from '../models/question';
 import * as pgPromise from 'pg-promise';
 
-const Q = require('../node_modules/q/q');
-const db = DB.getClient();
+const db = DB.client;
 
 class Result<T> {
   private result: T = null;
@@ -82,89 +81,38 @@ export class QuestionsDAO {
     return result;
   }
 
-  private rollBack(): Promise<any> {
-    return db.none('ROLLBACK');
-  }
-
-  private insertLabels(questionId: number, labels: { [key:string]:string; }): Promise<any> {
-    const labelsQuery = 'INSERT INTO labels(language, value) VALUES($1, $2) RETURNING id;';
-    const labelsPerQuestionQuery = 'INSERT INTO labels_per_question(question_id, label_id) VALUES($1, $2);';
-
-    function inner(languages: string[], p: Promise<any> = Promise.resolve()): Promise<any> {
-      const language = languages.shift();
-      if (!language) return p;
-      else {
-        const value = labels[language];
-        const deferred = Q.defer();
-
-        p.then(() => {
-          db.one(labelsQuery, [language, value])
-            .then(res => {
-              const labelId = res.id;
-
-              deferred.resolve(
-                db.none(labelsPerQuestionQuery, [questionId, labelId])
-                  .catch(err => {
-                    this.rollBack()
-                      .then(deferred.reject(err))
-                      .catch(deferred.reject(err));
-                  })
-              );
-            })
-            .catch(err => {
-              this.rollBack()
-                .then(deferred.reject(err))
-                .catch(deferred.reject(err));
-            })
-        });
-
-        return inner(languages, deferred.promise);
-      }
-    }
-
-    return inner(Object.keys(labels));
-  }
-
   all(): Result<Question[]> {
     const query = `
       SELECT questions.id, questions.name, labels.language, labels.value
       FROM questions
-      LEFT OUTER JOIN labels_per_question
-      ON labels_per_question.question_id = questions.id
       LEFT OUTER JOIN labels
-      ON labels_per_question.label_id = labels.id`;
+      ON labels.question_id = questions.id`;
     return this.fetchQuestions(query);
   }
 
   create(question: Question): Result<Question> {
     const queryString = 'INSERT INTO questions(name) VALUES($1) RETURNING id;';
+    const labelsQuery = 'INSERT INTO labels(language, value, question_id) VALUES($1, $2, $3);';
     const result = new Result<Question>();
 
-    db.none('BEGIN')
-      .then(() => {
-        db.one(queryString, question.name)
-          .then(res => {
-            const newId = res.id;
+    db.one(queryString, question.name)
+      .then(data => {
+        const newId = data.id;
+        question.id = newId;
 
-            this.insertLabels(newId, question.labels)
-              .then(() => {
-                db.none('COMMIT');
-                question.id = newId;
-                result.success(question);
-              })
-              .catch(err => {
-                result.fail(err);
-              });
-          })
-          .catch(err => {
-            this.rollBack();
-            result.fail(err);
-          });
+        db.tx(t => {
+          return t.batch([
+            ...Object.keys(question.labels).map(l => t.none(labelsQuery, [l, question.labels[l], newId]))
+          ]);
+        })
+        .then(() => result.success(question))
+        .catch(error => {
+          this.remove(newId)
+            .onSuccess(() => result.fail(error))
+            .onError(err => result.fail(err));
+        });
       })
-      .catch(err => {
-        this.rollBack();
-        result.fail(err);
-      });
+      .catch(error => result.fail(error));
 
     return result;
   }
@@ -173,10 +121,8 @@ export class QuestionsDAO {
     const query = `
       SELECT questions.id, questions.name, labels.language, labels.value
       FROM questions
-      LEFT OUTER JOIN labels_per_question
-      ON labels_per_question.question_id = questions.id
       LEFT OUTER JOIN labels
-      ON labels_per_question.label_id = labels.id
+      ON labels.question_id = questions.id
       WHERE questions.id = $1;`;
     const result = new Result<Question>();
     const arrayResult = this.fetchQuestions(query, questionId);
@@ -188,37 +134,18 @@ export class QuestionsDAO {
   update(question: Question): Result<Question> {
     const updateQuery = 'UPDATE questions SET name = $1 WHERE id = $2;';
     const deleteLabelsQuery = 'DELETE FROM labels_per_question WHERE question_id = $1;';
+    const updateLabelsQuery = 'INSERT INTO labels(language, value, question_id) VALUES($1, $2, $3);';
     const result = new Result<Question>();
 
-    db.none('BEGIN')
-      .then(() => {
-        db.none(updateQuery, [question.name, question.id])
-          .then(() => {
-            db.none(deleteLabelsQuery, question.id)
-              .then(() => {
-                this.insertLabels(question.id, question.labels)
-                  .then(() => {
-                    db.none('COMMIT');
-                    result.success(question);
-                  })
-                  .catch(err => {
-                    result.fail(err);
-                  });
-              })
-              .catch(err => {
-                this.rollBack();
-                result.fail(err);
-              });
-          })
-          .catch(err => {
-            this.rollBack();
-            result.fail(err);
-          });
+    db.tx(t => {
+      return t.batch([
+        t.one(updateQuery, [question.name, question.id]),
+        t.none(deleteLabelsQuery, question.id),
+        ...Object.keys(question.labels).map(l => t.none(updateLabelsQuery, [l, question.labels[l], question.id]))
+      ]);
     })
-    .catch(err => {
-      this.rollBack();
-      result.fail(err);
-    });
+    .then(data => result.success(question))
+    .catch(error => result.fail(error));
 
     return result;
   }
@@ -228,7 +155,7 @@ export class QuestionsDAO {
     const result = new Result<number>();
 
     db.any(queryString, questionId)
-      .then(res => result.success(res.rows.length))
+      .then(() => result.success(1))
       .catch(err => result.fail(err));
 
     return result;
